@@ -59,6 +59,9 @@ gssapi = ["ssl", "sasl2-sys"]
 # Build and link against the libsasl2 bundled with the sasl2-sys crate.
 gssapi-vendored = ["gssapi", "sasl2-sys/gssapi-vendored"]
 
+# Enable SCARM only (usefull for Windows)
+scram-vendored = ["ssl", "sasl2-sys/scram", "sasl2-sys/openssl-vendored"]
+
 # Deprecated alias for the `gssapi` feature.
 sasl = ["gssapi"]
 
