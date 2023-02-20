@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+* Upgrade to librdkafka v2.0.2.
+
 * Add the `RDKafkaDeleteGroup` and `RDKafkaGroupResult` type aliases to the
   `types` module.
 
