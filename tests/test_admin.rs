@@ -176,7 +176,7 @@ async fn test_topics() {
         };
         let expected_entry2 = ConfigEntry {
             name: "max.message.bytes".into(),
-            value: Some("1000012".into()),
+            value: Some("1048588".into()),// 1048588 is default since https://github.com/apache/kafka/pull/4154
             source: ConfigSource::Default,
             is_read_only: false,
             is_default: true,

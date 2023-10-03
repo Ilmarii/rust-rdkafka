@@ -10,7 +10,7 @@ bindgen \
     --no-layout-tests \
     --rustified-enum ".*" \
     --allowlist-function "rd_kafka.*" \
-    --allowlist-type "rd_kafka.*" \
+    --allowlist-type "rd_kafka.*|rd_ts_t" \
     --allowlist-var "rd_kafka.*|RD_KAFKA_.*" \
     --no-recursive-allowlist \
     --blocklist-function "rd_kafka_conf_set_open_cb" \
