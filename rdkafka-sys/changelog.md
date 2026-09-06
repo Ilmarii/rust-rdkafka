@@ -1,5 +1,8 @@
 # Changelog
 
+## vNEXT+2.15.1-RC1 (2026-09-06)
+* Bump librdkafka to v2.15.1-RC1.
+
 ## v4.10.0+2.12.1 (2026-01-25)
 * Bump librdkafka to v2.12.1.
 * Fix build script for musl builds that require SASL ([#818])
