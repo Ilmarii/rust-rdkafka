@@ -1347,3 +1347,184 @@ async fn test_consumer_reads_message_headers() {
         ],
     );
 }
+
+/// A pre-populated topic with many more messages than the batch size should be
+/// drained through `batch_stream` in batches that never exceed the batch size,
+/// with at least one batch being full, and every message delivered exactly once
+/// in offset order.
+#[tokio::test]
+async fn test_batch_stream_full_batches() {
+    init_test_logger();
+
+    const BATCH: usize = 10;
+
+    let kafka_context = KafkaContext::shared()
+        .await
+        .expect("could not create kafka context");
+
+    let producer = producer::future_producer::create_producer(&kafka_context.bootstrap_servers)
+        .await
+        .expect("Could not create Future producer");
+
+    let num_of_messages_to_send = 100usize;
+    let topic_name = rand_test_topic("test_batch_stream_full_batches");
+    let message_map = topics::populate_topic_using_future_producer(
+        &producer,
+        &topic_name,
+        num_of_messages_to_send,
+        Some(0),
+    )
+    .await
+    .expect("Could not populate topic using Future producer");
+
+    let consumer = utils::consumer::stream_consumer::create_stream_consumer(
+        &kafka_context.bootstrap_servers,
+        Some(&rand_test_group()),
+    )
+    .await
+    .expect("could not create stream consumer");
+    consumer
+        .subscribe(&[topic_name.as_str()])
+        .expect("could not subscribe to kafka topic");
+
+    let mut stream = consumer.batch_stream::<BATCH>();
+    let mut received = 0usize;
+    let mut full_batches = 0usize;
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut last_offset: Option<i64> = None;
+
+    let consume_all = async {
+        while received < num_of_messages_to_send {
+            let batch = stream
+                .next()
+                .await
+                .expect("batch stream ended unexpectedly")
+                .unwrap_or_else(|(_, e)| panic!("Error receiving batch: {:?}", e));
+
+            assert!(!batch.is_empty(), "batch stream yielded an empty batch");
+            assert!(
+                batch.len() <= BATCH,
+                "batch of {} messages exceeds batch size {}",
+                batch.len(),
+                BATCH
+            );
+            if batch.len() == BATCH {
+                full_batches += 1;
+            }
+
+            for m in batch.iter() {
+                assert_eq!(m.topic(), topic_name.as_str());
+                assert_eq!(m.partition(), 0);
+                if let Some(prev) = last_offset {
+                    assert!(
+                        m.offset() > prev,
+                        "messages within batches are out of order"
+                    );
+                }
+                last_offset = Some(m.offset());
+
+                let id = message_map[&(m.partition(), m.offset())];
+                assert!(seen_ids.insert(id), "message {} delivered twice", id);
+                assert_eq!(m.payload_view::<str>().unwrap().unwrap(), id.to_string());
+                assert_eq!(m.key_view::<str>().unwrap().unwrap(), id.to_string());
+            }
+            received += batch.len();
+        }
+    };
+    time::timeout(Duration::from_secs(60), consume_all)
+        .await
+        .expect("timed out waiting for all batches");
+
+    assert_eq!(received, num_of_messages_to_send);
+    assert_eq!(seen_ids.len(), num_of_messages_to_send);
+    assert!(
+        full_batches > 0,
+        "expected at least one full batch of {} messages",
+        BATCH
+    );
+}
+
+/// When fewer messages are available than the batch size, `batch_stream` must
+/// yield a partial batch instead of waiting for the batch to fill up, and must
+/// not yield empty batches once the topic is drained.
+#[tokio::test]
+async fn test_batch_stream_partial_batch() {
+    init_test_logger();
+
+    const BATCH: usize = 10;
+
+    let kafka_context = KafkaContext::shared()
+        .await
+        .expect("could not create kafka context");
+
+    let producer = producer::future_producer::create_producer(&kafka_context.bootstrap_servers)
+        .await
+        .expect("Could not create Future producer");
+
+    let num_of_messages_to_send = 3usize;
+    let topic_name = rand_test_topic("test_batch_stream_partial_batch");
+    let message_map = topics::populate_topic_using_future_producer(
+        &producer,
+        &topic_name,
+        num_of_messages_to_send,
+        Some(0),
+    )
+    .await
+    .expect("Could not populate topic using Future producer");
+
+    let consumer = utils::consumer::stream_consumer::create_stream_consumer(
+        &kafka_context.bootstrap_servers,
+        Some(&rand_test_group()),
+    )
+    .await
+    .expect("could not create stream consumer");
+    consumer
+        .subscribe(&[topic_name.as_str()])
+        .expect("could not subscribe to kafka topic");
+
+    let mut stream = consumer.batch_stream::<BATCH>();
+    let mut received = 0usize;
+
+    let consume_all = async {
+        while received < num_of_messages_to_send {
+            let batch = stream
+                .next()
+                .await
+                .expect("batch stream ended unexpectedly")
+                .unwrap_or_else(|(_, e)| panic!("Error receiving batch: {:?}", e));
+
+            assert!(!batch.is_empty(), "batch stream yielded an empty batch");
+            assert!(
+                batch.len() < BATCH,
+                "only {} messages exist, so no batch can be full",
+                num_of_messages_to_send
+            );
+            for m in batch.iter() {
+                let id = message_map[&(m.partition(), m.offset())];
+                assert_eq!(m.payload_view::<str>().unwrap().unwrap(), id.to_string());
+            }
+            received += batch.len();
+        }
+    };
+    // The whole point of this test: a partial batch must be delivered promptly
+    // rather than the stream blocking until a full batch is available.
+    time::timeout(Duration::from_secs(60), consume_all)
+        .await
+        .expect("batch stream blocked waiting for a full batch");
+    assert_eq!(received, num_of_messages_to_send);
+
+    // With the topic drained, the stream must stay pending instead of yielding
+    // empty batches.
+    let next = time::timeout(Duration::from_secs(2), stream.next()).await;
+    let yielded = match &next {
+        Err(_elapsed) => None,
+        Ok(None) => Some("end of stream".to_string()),
+        Ok(Some(Ok(batch))) => Some(format!("batch of {} messages", batch.len())),
+        Ok(Some(Err((batch, e)))) => Some(format!("error {:?} with {} messages", e, batch.len())),
+    };
+    assert!(
+        yielded.is_none(),
+        "batch stream yielded from a drained topic: {}",
+        yielded.unwrap()
+    );
+}

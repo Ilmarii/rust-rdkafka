@@ -17,6 +17,7 @@ use slab::Slab;
 
 use rdkafka_sys as rdsys;
 use rdkafka_sys::types::*;
+use smallvec::SmallVec;
 
 use crate::client::{Client, EventPollResult, NativeQueue};
 use crate::config::{ClientConfig, FromClientConfig, FromClientConfigAndContext};
@@ -178,6 +179,133 @@ impl<C: ConsumerContext> Drop for MessageStream<'_, C> {
     }
 }
 
+/// A stream of message batches from a [`StreamConsumer`].
+///
+/// See the documentation of [`StreamConsumer::batch_stream`] for details.
+pub struct MessageBatchStream<'a, C: ConsumerContext, const BATCH: usize> {
+    wakers: &'a WakerSlab,
+    consumer: &'a BaseConsumer<C>,
+    partition_queue: Option<&'a NativeQueue>,
+    slot: usize,
+}
+
+impl<'a, C: ConsumerContext, const BATCH: usize> MessageBatchStream<'a, C, BATCH> {
+    fn new(
+        wakers: &'a WakerSlab,
+        consumer: &'a BaseConsumer<C>,
+    ) -> MessageBatchStream<'a, C, BATCH> {
+        Self::new_with_optional_partition_queue(wakers, consumer, None)
+    }
+
+    fn new_with_partition_queue(
+        wakers: &'a WakerSlab,
+        consumer: &'a BaseConsumer<C>,
+        partition_queue: &'a NativeQueue,
+    ) -> MessageBatchStream<'a, C, BATCH> {
+        Self::new_with_optional_partition_queue(wakers, consumer, Some(partition_queue))
+    }
+
+    fn new_with_optional_partition_queue(
+        wakers: &'a WakerSlab,
+        consumer: &'a BaseConsumer<C>,
+        partition_queue: Option<&'a NativeQueue>,
+    ) -> MessageBatchStream<'a, C, BATCH> {
+        let slot = wakers.register();
+        MessageBatchStream {
+            wakers,
+            consumer,
+            partition_queue,
+            slot,
+        }
+    }
+
+    fn poll(&self) -> EventPollResult<KafkaResult<BorrowedMessage<'a>>> {
+        if let Some(queue) = self.partition_queue {
+            self.consumer.poll_queue(queue, Duration::ZERO)
+        } else {
+            self.consumer
+                .poll_queue(self.consumer.get_queue(), Duration::ZERO)
+        }
+    }
+}
+
+impl<'a, C: ConsumerContext, const BATCH: usize> Stream for MessageBatchStream<'a, C, BATCH> {
+    type Item = Result<
+        SmallVec<[BorrowedMessage<'a>; BATCH]>,
+        (SmallVec<[BorrowedMessage<'a>; BATCH]>, KafkaError),
+    >;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        const { assert!(BATCH > 0, "batch size must be greater than zero") };
+
+        let mut messages = SmallVec::<[BorrowedMessage<'a>; BATCH]>::new();
+
+        loop {
+            match self.poll() {
+                EventPollResult::Event(Ok(message)) => {
+                    messages.push(message);
+                    if messages.len() >= BATCH {
+                        return Poll::Ready(Some(Ok(messages)));
+                    }
+                }
+                EventPollResult::Event(Err(err)) => {
+                    return Poll::Ready(Some(Err((messages, err))));
+                }
+                EventPollResult::EventConsumed => {
+                    // A rebalance or offset commit event was handled. Treat it as
+                    // a natural batch boundary: yield what we have, or otherwise
+                    // yield to the runtime like `MessageStream` does.
+                    if !messages.is_empty() {
+                        return Poll::Ready(Some(Ok(messages)));
+                    }
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                EventPollResult::None => {
+                    // The queue is empty. Yield the partial batch immediately.
+                    if !messages.is_empty() {
+                        return Poll::Ready(Some(Ok(messages)));
+                    }
+
+                    // Otherwise, we need to wait for a message to become available. Store
+                    // the waker so that we are woken up if the queue flips from non-empty
+                    // to empty. We have to store the waker repeatedly in case this future
+                    // migrates between tasks.
+                    self.wakers.set_waker(self.slot, cx.waker().clone());
+
+                    // Check whether a new message became available after we installed the
+                    // waker. This avoids a race where `poll` returns None to indicate that
+                    // the queue is empty, but the queue becomes non-empty before we've
+                    // installed the waker.
+                    match self.poll() {
+                        EventPollResult::Event(Ok(message)) => {
+                            messages.push(message);
+                            if messages.len() >= BATCH {
+                                return Poll::Ready(Some(Ok(messages)));
+                            }
+                            // Otherwise keep accumulating.
+                        }
+                        EventPollResult::Event(Err(err)) => {
+                            return Poll::Ready(Some(Err((messages, err))));
+                        }
+                        EventPollResult::EventConsumed => {
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
+                        EventPollResult::None => return Poll::Pending,
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<C: ConsumerContext, const BATCH: usize> Drop for MessageBatchStream<'_, C, BATCH> {
+    fn drop(&mut self) {
+        self.wakers.unregister(self.slot);
+    }
+}
+
 /// A high-level consumer with a [`Stream`] interface.
 ///
 /// This consumer doesn't need to be polled explicitly. Extracting an item from
@@ -289,6 +417,22 @@ where
     /// consumers, not multiple message streams.
     pub fn stream(&self) -> MessageStream<'_, C> {
         MessageStream::new(&self.wakers, &self.base)
+    }
+
+    /// Constructs a stream that yields message batches from this consumer.
+    ///
+    /// It is legal to have multiple live message streams for the same consumer,
+    /// and to move those message streams across threads. Note, however, that
+    /// the message streams share the same underlying state. A message received
+    /// by the consumer will be delivered to only one of the live message
+    /// streams. If you seek the underlying consumer, all message streams
+    /// created from the consumer will begin to draw messages from the new
+    /// position of the consumer.
+    ///
+    /// If you want multiple independent views of a Kafka topic, create multiple
+    /// consumers, not multiple message streams.
+    pub fn batch_stream<const BATCH: usize>(&self) -> MessageBatchStream<'_, C, BATCH> {
+        MessageBatchStream::new(&self.wakers, &self.base)
     }
 
     /// Receives the next message from the stream.
@@ -585,6 +729,26 @@ where
     /// multiple consumers, not multiple partition streams.
     pub fn stream(&self) -> MessageStream<'_, C> {
         MessageStream::new_with_partition_queue(
+            &self.wakers,
+            &self._consumer.base,
+            &self.queue.queue,
+        )
+    }
+
+    /// Constructs a stream that yields message batches from this partition.
+    ///
+    /// It is legal to have multiple live message streams for the same
+    /// partition, and to move those message streams across threads. Note,
+    /// however, that the message streams share the same underlying state. A
+    /// message received by the partition will be delivered to only one of the
+    /// live message streams. If you seek the underlying partition, all message
+    /// streams created from the partition will begin to draw messages from the
+    /// new position of the partition.
+    ///
+    /// If you want multiple independent views of a Kafka partition, create
+    /// multiple consumers, not multiple partition streams.
+    pub fn batch_stream<const BATCH: usize>(&self) -> MessageBatchStream<'_, C, BATCH> {
+        MessageBatchStream::new_with_partition_queue(
             &self.wakers,
             &self._consumer.base,
             &self.queue.queue,
